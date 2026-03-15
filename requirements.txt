@@ -1,0 +1,36 @@
+# AI Agent Security Shield - Dependencies
+# Core Framework
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-anthropic>=0.3.0
+
+# LLM
+anthropic>=0.40.0
+
+# Vector Store (Attack Pattern Cache)
+chromadb>=0.5.0
+
+# Document Scanning (Memory Guard - Day 3)
+pymupdf>=1.24.0
+
+# PII Detection (Output Guard - Day 5)
+presidio-analyzer>=2.2.0
+presidio-anonymizer>=2.2.0
+spacy>=3.7.0
+
+# API Server (Dashboard Backend - Day 8)
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.9.0
+httpx>=0.27.0
+numpy>=1.26.0
+
+# Testing
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+
+# Security / Crypto (Audit Trail - Day 11)
+cryptography>=43.0.0
