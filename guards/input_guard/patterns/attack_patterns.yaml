@@ -1,0 +1,474 @@
+# =============================================================================
+# AI Agent Security Shield — Attack Pattern Library
+# =============================================================================
+#
+# Loaded at runtime by PatternMatcher. No code changes needed to add/tune a
+# pattern — edit this file, restart, done.
+#
+# Format (per pattern):
+#   name:        unique snake_case identifier
+#   regex:       Python regex string (single-quoted — backslashes are literal)
+#   severity:    0.0 (informational) → 1.0 (critical)
+#   description: human-readable explanation (for audit logs + analyst review)
+#
+# Verdict thresholds (set in pattern_matcher.py):
+#   SAFE:        confidence < 0.30
+#   SUSPICIOUS:  0.30 ≤ confidence < 0.70   (sanitize + monitor)
+#   MALICIOUS:   confidence ≥ 0.70          (block entirely)
+#
+# Confidence formula:
+#   (0.7 × top_severity) + (0.3 × average_severity) + (0.10 × obfuscation_layers)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Typoglycemia Keywords
+# Words the TypoglycemiaDetector watches for in scrambled form.
+# Format: keyword: confidence_if_scrambled_variant_detected
+# -----------------------------------------------------------------------------
+typoglycemia_keywords:
+  ignore:        0.85
+  jailbreak:     0.90
+  override:      0.85
+  disregard:     0.85
+  bypass:        0.85
+  instructions:  0.78
+  exfiltrate:    0.90
+  unrestricted:  0.85
+  uncensored:    0.85
+  injection:     0.80
+  malicious:     0.75
+  forbidden:     0.75
+
+
+# -----------------------------------------------------------------------------
+# Attack Pattern Categories
+# -----------------------------------------------------------------------------
+categories:
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 1: Instruction Override (13 patterns)
+  # Attempts to replace or nullify the agent's system prompt.
+  # ---------------------------------------------------------------------------
+  instruction_override:
+    description: "Direct attempts to override or replace agent instructions"
+    patterns:
+
+      - name: ignore_prev_instructions
+        regex: 'ignore\s+(all\s+)?(previous|prior|above|earlier)\s+instructions?'
+        severity: 0.95
+        description: "Classic ignore-previous-instructions override"
+
+      - name: disregard_instructions
+        regex: 'disregard\s+(all\s+)?(previous|prior|your|the)(\s+\w+)?\s+instructions?'
+        severity: 0.95
+        description: "Disregard variant of instruction override"
+
+      - name: forget_instructions
+        regex: 'forget\s+(everything|all|your|the|previous)\s*(instructions?|above|prompt)?'
+        severity: 0.90
+        description: "Forget-everything instruction wipe attempt"
+
+      - name: override_instructions
+        regex: 'override\s+(your\s+)?(previous|all|system|safety)?\s*instructions?'
+        severity: 0.95
+        description: "Explicit override keyword targeting instructions"
+
+      - name: new_instructions_follow
+        regex: '(your\s+)?new\s+instructions?\s*(are|follow|below|:)'
+        severity: 0.85
+        description: "Injection disguised as new instruction set"
+
+      - name: actually_instructions
+        regex: 'actually[,\s]+your\s+(real\s+)?instructions?\s+(are|say)'
+        severity: 0.80
+        description: "Social engineering to redefine agent instructions"
+
+      - name: real_task_is
+        regex: '(your\s+)?real\s+task\s+is\s+to'
+        severity: 0.85
+        description: "Redefines agent purpose with claimed 'real' task"
+
+      - name: from_now_on
+        regex: 'from\s+now\s+on[,\s]+(you\s+)?(will|must|should|are\s+to)'
+        severity: 0.80
+        description: "Persistent instruction override using 'from now on'"
+
+      - name: starting_now
+        regex: 'starting\s+now[,\s]+(you\s+)?(will|must|should)'
+        severity: 0.80
+        description: "Persistent instruction override using 'starting now'"
+
+      - name: end_of_instructions
+        regex: '---\s*(end\s+of\s+)?instructions?\s*---'
+        severity: 0.75
+        description: "Delimiter injection to close the system prompt section"
+
+      - name: bypass_security
+        regex: '(bypass|circumvent|get\s+around)\s+(security|safety|restriction|filter|guardrail)'
+        severity: 0.88
+        description: "Direct request to bypass security controls"
+
+      - name: ignore_all_instructions
+        regex: 'ignore\s+all\s+instructions?'
+        severity: 0.90
+        description: "Simplified ignore-all variant (catches hex/leet decoded payloads)"
+
+      - name: ignore_safety_rules
+        regex: 'ignore\s+(all\s+)?(safety|rules|guidelines|restrictions?|ethics|filters?)'
+        severity: 0.85
+        description: "Instruction to discard safety guidelines"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 2: Role-Play & Persona Manipulation (11 patterns)
+  # Tricks the agent into adopting an unrestricted persona.
+  # ---------------------------------------------------------------------------
+  persona_manipulation:
+    description: "Role-play and persona tricks to bypass safety alignment"
+    patterns:
+
+      - name: you_are_now
+        regex: 'you\s+are\s+now\s+(a|an|the)\s+\w+'
+        severity: 0.80
+        description: "Assigns agent a new identity"
+
+      - name: pretend_you_are
+        regex: 'pretend\s+(you\s+are|to\s+be)\s+(a|an|the)?\s*\w+'
+        severity: 0.80
+        description: "Roleplay framing to bypass restrictions"
+
+      - name: act_as
+        regex: '\bact\s+as\s+(a|an|the)?\s*\w+\s*(with\s+no|without|that\s+(can|will|has))?'
+        severity: 0.75
+        description: "Act-as persona assignment, often paired with 'no restrictions'"
+
+      - name: roleplay_as
+        regex: '(role\s*play|roleplay)\s+as\s+(a|an|the)?\s*\w+'
+        severity: 0.75
+        description: "Roleplay directive to adopt alternate persona"
+
+      - name: simulate_being
+        regex: 'simulate\s+(being|a|an)\s+\w+'
+        severity: 0.75
+        description: "Simulation framing for persona bypass"
+
+      - name: dan_jailbreak
+        regex: '\bDAN\b.{0,50}(mode|enabled|jailbreak|unrestricted)'
+        severity: 0.98
+        description: "DAN (Do Anything Now) jailbreak — highest severity"
+
+      - name: no_restrictions
+        regex: '(no\s+restrictions?|without\s+restrictions?|unrestricted\s+mode)'
+        severity: 0.90
+        description: "Explicit request for unrestricted operation"
+
+      - name: true_self
+        regex: '(your\s+)?(true\s+self|inner\s+(self|ai)|real\s+you)'
+        severity: 0.85
+        description: "Psychological framing to unlock 'hidden' unrestricted mode"
+
+      - name: developer_mode
+        regex: '(enable|activate|enter|switch\s+to)?\s*developer\s+mode'
+        severity: 0.90
+        description: "Developer mode activation — common jailbreak vector"
+
+      - name: developer_mode_colon
+        regex: 'developer\s+mode\s*:'
+        severity: 0.85
+        description: "Developer mode with colon delimiter injection"
+
+      - name: jailbreak_mode
+        regex: 'jailbreak\s+(mode|enabled|this|the\s+ai)'
+        severity: 0.95
+        description: "Explicit jailbreak mode declaration"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 3: System Prompt Extraction (10 patterns)
+  # Attempts to reveal the agent's hidden instructions.
+  # ---------------------------------------------------------------------------
+  system_prompt_extraction:
+    description: "Attempts to extract or reveal the agent's system prompt"
+    patterns:
+
+      - name: print_system_prompt
+        regex: '(print|show|reveal|display|output|repeat|tell\s+me)\s+(your\s+)?(\w+\s+)?(system\s+prompt|instructions?|initial\s+prompt|original\s+prompt)'
+        severity: 0.95
+        description: "Direct request to print the system prompt"
+
+      - name: what_are_instructions
+        regex: 'what\s+(are|were)\s+your\s+(initial\s+|original\s+|system\s+)?(instructions?|prompt|rules|directives?)'
+        severity: 0.85
+        description: "Inquiry framing to extract instructions"
+
+      - name: show_me_instructions
+        regex: '(show|give)\s+me\s+(your\s+)?(\w+\s+)?(instructions?|prompt|rules)\s+(exactly|verbatim|as\s+written)'
+        severity: 0.88
+        description: "Verbatim extraction request"
+
+      - name: ignore_hide_instructions
+        regex: '(don''?t|do\s+not)\s+(hide|keep\s+secret|conceal)\s+(your\s+)?instructions?'
+        severity: 0.85
+        description: "Pressure to not hide instructions"
+
+      - name: copy_paste_system
+        regex: 'copy\s+(and\s+paste|paste)\s+(your\s+)?(system|initial)\s+(prompt|instructions?)'
+        severity: 0.90
+        description: "Copy-paste extraction request"
+
+      - name: beginning_of_convo
+        regex: '(what|tell\s+me)\s+(was|is|were)?\s*(at\s+the\s+)?beginning\s+of\s+(this\s+)?(conversation|prompt|context)'
+        severity: 0.80
+        description: "Indirect extraction via conversation beginning inquiry"
+
+      - name: translate_instructions
+        regex: 'translate\s+your\s+(system\s+)?(instructions?|prompt)\s+to'
+        severity: 0.85
+        description: "Translation trick to exfiltrate instructions"
+
+      - name: summarize_prompt
+        regex: 'summarize\s+your\s+(system\s+)?prompt'
+        severity: 0.85
+        description: "Summary request targeting system prompt"
+
+      - name: output_verbatim
+        regex: 'output\s+(verbatim|exactly|word\s+for\s+word).{0,50}(prompt|instructions?)'
+        severity: 0.90
+        description: "Verbatim output demand"
+
+      - name: reveal_hidden_prompt
+        regex: 'reveal\s+.{0,20}(hidden|secret|actual|true|real)\s+(system\s+)?(prompt|instructions?)'
+        severity: 0.90
+        description: "Reveal-hidden framing for prompt extraction"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 4: Indirect Injection (10 patterns)
+  # Instructions hidden in documents, web pages, emails, git commits, etc.
+  # Most dangerous category — agent processes external content.
+  # ---------------------------------------------------------------------------
+  indirect_injection:
+    description: "Instructions embedded in external content the agent processes"
+    patterns:
+
+      - name: attention_llm
+        regex: '(attention|note|important)\s*(to\s+)?(:|llm|ai|assistant|language\s+model)'
+        severity: 0.90
+        description: "Attention-LLM marker used in document injection attacks"
+
+      - name: hidden_instruction_marker
+        regex: '<!--.*?(ignore|override|forget|new\s+instruction).*?-->'
+        severity: 0.90
+        description: "HTML comment used to hide injected instructions"
+
+      - name: document_injection
+        regex: '\[SYSTEM\]|\[INST\]|\[PROMPT\]|\[OVERRIDE\]'
+        severity: 0.85
+        description: "Special tokens used to inject into agent context"
+
+      - name: url_injection_pattern
+        regex: '(forward|send|transmit|post)\s+.{0,30}to\s+(https?://|\S+\.\S+/)'
+        severity: 0.98
+        description: "Data exfiltration via URL — highest indirect injection severity"
+
+      - name: exfiltrate_to_url
+        regex: '(exfiltrate|leak|send)\s+.{0,20}(data|info|content|memory)\s+to'
+        severity: 0.95
+        description: "Explicit exfiltration command"
+
+      - name: eval_execute
+        regex: '(execute|eval|run)\s+(the\s+following|this)\s+(code|command|script)'
+        severity: 0.85
+        description: "Code execution directive embedded in content"
+
+      - name: sudo_override
+        regex: 'sudo\s+(override|ignore|bypass|disable)\s+(security|safety|filter)'
+        severity: 0.90
+        description: "sudo-flavoured override attempt"
+
+      - name: decode_and_follow
+        regex: '(decode|decrypt|base64).{0,60}(follow|execute|apply|then)'
+        severity: 0.88
+        description: "Two-stage attack: decode payload then follow instructions"
+
+      - name: exfiltrate_data
+        regex: '\bexfiltrate\b.{0,50}(data|session|memory|conversation)'
+        severity: 0.92
+        description: "Exfiltration keyword targeting agent memory"
+
+      - name: forward_to_domain
+        regex: '(forward|send|transmit)\s+.{0,40}to\s+\S+\.(com|net|org|io|xyz)\S*'
+        severity: 0.90
+        description: "Domain-targeted forwarding / exfiltration"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 5: Jailbreak Variants (11 patterns)
+  # Known jailbreak techniques and exploits.
+  # ---------------------------------------------------------------------------
+  jailbreak:
+    description: "Known jailbreak techniques and safety filter bypasses"
+    patterns:
+
+      - name: do_anything_now
+        regex: '\bDAN\b|\bdo\s+anything\s+now\b'
+        severity: 0.98
+        description: "DAN acronym — highest severity jailbreak"
+
+      - name: opposite_mode
+        regex: '(opposite|reverse|anti|contra)\s+mode\s+(enabled|activated|on)'
+        severity: 0.85
+        description: "Opposite/reverse mode trick to invert safety behavior"
+
+      - name: hypothetically_speaking
+        regex: 'hypothetically\s+speaking.{0,120}(how\s+(would|to|could)|synthesize|make|create|build)'
+        severity: 0.75
+        description: "Hypothetical framing to extract harmful how-to information"
+
+      - name: grandma_exploit
+        regex: '(my\s+)?(grandma|grandmother).{0,100}(how\s+to|used\s+to\s+tell|would\s+tell)'
+        severity: 0.75
+        description: "Grandma exploit — emotional framing to bypass filters"
+
+      - name: token_budget_override
+        regex: '(token|context|word)\s+budget\s+(is\s+(now\s+)?|has\s+been\s+)?(unlimited|removed|reset|infinite)'
+        severity: 0.85
+        description: "Token budget manipulation to bypass output filters"
+
+      - name: safety_filter_off
+        regex: '(turn\s+off|disable|bypass|remove)\s+(the\s+)?(safety|content|filter|guardrail)'
+        severity: 0.90
+        description: "Direct request to disable safety filtering"
+
+      - name: filter_off_statement
+        regex: '(safety|content|security)\s+filter\s+(off|disabled|bypassed|removed)'
+        severity: 0.88
+        description: "Statement claiming filter is already disabled"
+
+      - name: base_model_mode
+        regex: '(switch\s+to|enter|use)\s+(base\s+model|raw\s+model|uncensored)\s+mode'
+        severity: 0.90
+        description: "Request to switch to uncensored base model mode"
+
+      - name: without_ethics
+        regex: '(without|ignoring)\s+(ethics?|ethical|moral|safety)\s+(considerations?|guidelines?|rules?)'
+        severity: 0.88
+        description: "Explicit ethical bypass request"
+
+      - name: raw_model_output
+        regex: 'raw\s+(model\s+)?(output|response|mode)\s+(only|enabled)'
+        severity: 0.85
+        description: "Raw/unfiltered model output request"
+
+      - name: no_censoring
+        regex: 'no\s+(censoring|censorship|filters?|restrictions?|guardrails?)'
+        severity: 0.85
+        description: "Blanket no-censorship demand"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 6: Privilege Escalation (5 patterns)
+  # Claiming elevated authority to unlock restricted capabilities.
+  # ---------------------------------------------------------------------------
+  privilege_escalation:
+    description: "Claimed authority or elevated permissions to unlock capabilities"
+    patterns:
+
+      - name: admin_override
+        regex: '(admin|administrator|root|superuser)\s+(override|access|mode|command)'
+        severity: 0.90
+        description: "Admin/root authority claim for override"
+
+      - name: i_am_developer
+        regex: 'i\s+am\s+(the\s+)?(developer|admin|creator|anthropic|openai|owner)'
+        severity: 0.85
+        description: "Identity claim of developer/creator authority"
+
+      - name: authorized_to_ask
+        regex: 'i\s+(am|have\s+been)\s+authorized\s+(as|to)\s+(ask|request|access|override|an?\s+admin)'
+        severity: 0.80
+        description: "Claimed authorization for privileged access"
+
+      - name: special_permission
+        regex: '(special|emergency|elevated)\s+(permission|access|clearance|mode)'
+        severity: 0.80
+        description: "Special/emergency permission claim"
+
+      - name: maintenance_mode
+        regex: '(entering|enable|activate)\s+(maintenance|debug|service)\s+mode'
+        severity: 0.85
+        description: "Maintenance/debug mode activation attempt"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 7: HTML / Markup Injection (6 patterns)
+  # Script and markup payloads embedded in agent input/output.
+  # ---------------------------------------------------------------------------
+  markup_injection:
+    description: "HTML, JavaScript, and markup injection payloads"
+    patterns:
+
+      - name: script_tag
+        regex: '<script[\s>]'
+        severity: 0.95
+        description: "HTML script tag injection"
+
+      - name: iframe_inject
+        regex: '<iframe[\s>]'
+        severity: 0.90
+        description: "iframe injection"
+
+      - name: onclick_inject
+        regex: 'on(click|load|error|mouseover)\s*='
+        severity: 0.85
+        description: "JavaScript event handler injection"
+
+      - name: javascript_url
+        regex: 'javascript\s*:'
+        severity: 0.90
+        description: "javascript: URI scheme injection"
+
+      - name: data_uri_script
+        regex: 'data\s*:\s*text/html'
+        severity: 0.85
+        description: "data: URI used to embed HTML/JS payloads"
+
+      - name: markdown_link_inject
+        regex: '\[.*?\]\(javascript:'
+        severity: 0.90
+        description: "Markdown link with javascript: URI — XSS via rendered output"
+
+
+  # ---------------------------------------------------------------------------
+  # CATEGORY 8: Prompt Delimiter Attacks (5 patterns)
+  # Exploiting how LLMs parse turn markers and structural tokens.
+  # ---------------------------------------------------------------------------
+  delimiter_attack:
+    description: "Attempts to inject structural tokens and delimiters to escape context"
+    patterns:
+
+      - name: human_turn_injection
+        regex: '(Human|User|Assistant|System)\s*:\s*ignore'
+        severity: 0.85
+        description: "Turn-marker injection to impersonate system/user role"
+
+      - name: triple_backtick_escape
+        regex: '```\s*(system|assistant|human)\s*\n'
+        severity: 0.80
+        description: "Code block used to inject role-switching tokens"
+
+      - name: xml_tag_injection
+        regex: '<(system|user|assistant|human|prompt)>.*?</(system|user|assistant|human|prompt)>'
+        severity: 0.85
+        description: "XML-style role tags injected into content"
+
+      - name: special_token_inject
+        regex: '(\[INST\]|\[/INST\]|<s>|</s>|\|ENDOFTEXT\|)'
+        severity: 0.80
+        description: "Model-specific special tokens (Llama, GPT) injected to escape context"
+
+      - name: separator_attack
+        regex: '={5,}|#{5,}|\*{5,}|-{10,}'
+        severity: 0.40
+        description: "Heavy separator lines — low severity signal of delimiter injection attempt"
