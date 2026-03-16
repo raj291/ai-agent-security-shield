@@ -16,7 +16,7 @@ dist/
 build/
 
 # Data
-data/
+
 *.db
 *.sqlite
 
@@ -43,3 +43,4 @@ htmlcov/
 # Node (Dashboard)
 dashboard/node_modules/
 dashboard/dist/
+data/chroma_cache/

@@ -1,0 +1,62 @@
+# =============================================================================
+# AI Agent Security Shield — Scope Policy
+# =============================================================================
+#
+# Defines what the protected agent IS and IS NOT allowed to process.
+# Layer 3 (ScopeValidator) enforces these rules against every input that
+# passed Layers 1 and 2.
+#
+# Edit this file to change scope — no code changes required.
+#
+# Format:
+#   forbidden_patterns: regex rules that flag out-of-scope input
+#   max_input_length:   character limit (prevents prompt stuffing)
+#
+# Adding a new forbidden pattern:
+#   - name: your_rule_name
+#     regex: 'your\s+regex\s+here'   (single-quoted, backslashes literal)
+#     reason: "Human-readable explanation shown in audit log"
+# =============================================================================
+
+agent_scope:
+  name: "General Business Assistant"
+  description: >
+    Assists with business analysis, data queries, reporting, and general
+    knowledge questions. Does not execute system commands, perform
+    destructive database operations, or handle raw credentials.
+
+  # ---------------------------------------------------------------------------
+  # Hard limits
+  # ---------------------------------------------------------------------------
+  max_input_length: 10000   # Characters. Prevents context stuffing attacks.
+
+  # ---------------------------------------------------------------------------
+  # Forbidden Patterns
+  # Inputs matching ANY of these rules are flagged as out-of-scope.
+  # Severity is SUSPICIOUS (not MALICIOUS) — operators review these.
+  # ---------------------------------------------------------------------------
+  forbidden_patterns:
+
+    - name: sql_destructive
+      regex: '\b(DROP|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE)\s+\w+'
+      reason: "Destructive SQL operations are outside agent scope"
+
+    - name: system_commands
+      regex: '(rm\s+-rf|sudo\s+rm|format\s+[a-z]:|del\s+/[fqs]|mkfs\b|dd\s+if=)'
+      reason: "System-level destructive commands are outside agent scope"
+
+    - name: credential_in_input
+      regex: '(api[_\-]?key|secret[_\-]?key|private[_\-]?key|access[_\-]?token)\s*[:=]\s*\S{8,}'
+      reason: "Raw credentials must not be sent to the agent — use a secrets manager"
+
+    - name: shell_pipe_chain
+      regex: '\|\s*(bash|sh|zsh|cmd|powershell|python|perl|ruby|node)\b'
+      reason: "Shell pipe chains targeting interpreters are outside agent scope"
+
+    - name: mass_data_request
+      regex: '(dump|export|extract)\s+(all|every|entire|full)\s+(database|table|users?|records?|data)'
+      reason: "Bulk data extraction requests require direct database access, not agent"
+
+    - name: network_scan
+      regex: '(nmap|masscan|shodan|port\s+scan|network\s+scan)\s+\S+'
+      reason: "Network scanning is outside agent scope"
