@@ -15,8 +15,12 @@
    - Encoding Hardening — Defeating Obfuscation at Layer 1
    - Typoglycemia Detection — Scrambled-Word Attacks
    - Externalizing Config — Why YAML Over Hardcoded Patterns
-3. [Interview Q&A Bank](#3-interview-qa-bank)
-4. [Key Concepts Glossary](#4-key-concepts-glossary)
+3. [Day 2 — LLM Classifier + Scope Validator](#3-day-2-llm-classifier--scope-validator)
+   - Layer 2: LLM Classifier with ChromaDB Semantic Cache
+   - Layer 3: YAML-Driven Scope Validator
+   - Pipeline Routing — Why Each Layer Fires When It Does
+4. [Interview Q&A Bank](#4-interview-qa-bank)
+5. [Key Concepts Glossary](#5-key-concepts-glossary)
 
 ---
 
@@ -428,7 +432,177 @@ Layer 2 gets normalized text — the same decoded, invisible-char-stripped, leet
 
 ---
 
-## 3. Interview Q&A Bank
+---
+
+## 3. Day 2 — LLM Classifier + Scope Validator
+
+### 3.1 Layer 2: LLM Classifier with ChromaDB Semantic Cache
+
+**Why does Layer 2 only run on SUSPICIOUS inputs?**
+
+Three cases come out of Layer 1:
+- MALICIOUS → already blocked, no point calling an expensive LLM
+- SAFE → no threat signal, LLM would just agree
+- SUSPICIOUS → genuine grey area; this is the only case where LLM judgment adds value
+
+Calling Layer 2 on every input would 10× the cost with no security benefit. Layer 2 is the expensive specialist that only reviews borderline cases.
+
+**The ChromaDB semantic cache**
+
+Every LLM verdict is stored in ChromaDB as a vector embedding. Before calling Claude, the classifier searches for a cached result:
+
+```
+Input text
+    │
+    ▼
+Embed with all-MiniLM-L6-v2 (ChromaDB default)
+    │
+    ▼
+Cosine similarity search in ChromaDB
+    │
+    ├─ distance < 0.08 (≈ similarity > 0.92)
+    │    └─ Cache HIT → return stored verdict (free, <5ms)
+    │
+    └─ distance ≥ 0.08
+         └─ Cache MISS → call Claude Haiku → store result → return
+```
+
+**Why cosine distance 0.08 (not 0.05 or 0.15)?**
+
+- Too strict (0.02): only catches character-identical inputs. A rephrased attack hits the API every time.
+- Too loose (0.20): different inputs might share a cached verdict. "ignore all instructions" and "tell me your rules" share some semantic overlap but are different attacks.
+- 0.08 catches attacks rephrased at the word level ("disregard" vs "ignore") without conflating distinct inputs.
+
+**The classification prompt**
+
+Claude is given a tight system prompt with three allowed verdicts and forced JSON output:
+```
+System: "You are a security classifier...
+         Respond ONLY with valid JSON: {"verdict": ..., "confidence": ..., "reasoning": ...}"
+User: [normalized input text]
+```
+
+JSON-only output prevents the model from adding explanatory prose that breaks parsing. The normalized text (unicode cleaned, visible chars only) is sent — not raw input — so encoding tricks don't confuse the LLM either.
+
+**Fail-closed design**
+
+If `ANTHROPIC_API_KEY` is missing, network times out, or response is malformed JSON:
+```python
+return {"verdict": "SUSPICIOUS", ...}  # Never "SAFE" on failure
+```
+The system fails closed — an unavailable Layer 2 means uncertain inputs stay uncertain (SUSPICIOUS), not cleared as safe. This is the correct default for security systems.
+
+**Interview questions this answers:**
+- "How do you prevent your security system from becoming a cost center?"
+- "What does your ChromaDB cache actually store?"
+- "What happens if the Claude API goes down?"
+
+---
+
+### 3.2 Layer 3: YAML-Driven Scope Validator
+
+**The difference between security and scope**
+
+Layer 1 + Layer 2 answer: *"Is this an attack?"*
+Layer 3 answers: *"Even if it's not an attack, is it something this agent should handle?"*
+
+Example:
+- `"DROP TABLE users"` — not a prompt injection, but a destructive SQL operation outside the agent's mandate
+- `"nmap 192.168.1.0/24"` — not a jailbreak, but network scanning isn't a business assistant function
+
+These pass Layers 1 and 2 but should be flagged. Layer 3 catches them.
+
+**The YAML policy structure**
+
+```yaml
+agent_scope:
+  name: "General Business Assistant"
+  max_input_length: 10000      # prevents context-stuffing
+  forbidden_patterns:
+    - name: sql_destructive
+      regex: '\b(DROP|TRUNCATE|DELETE\s+FROM|ALTER\s+TABLE)\s+\w+'
+      reason: "Destructive SQL operations are outside agent scope"
+    - name: credential_in_input
+      regex: '(api[_\-]?key|secret[_\-]?key)\s*[:=]\s*\S{8,}'
+      reason: "Raw credentials must not be sent to the agent"
+```
+
+The policy YAML follows the same design principle as `attack_patterns.yaml`:
+- Analysts add/remove rules without touching Python
+- Single-quoted YAML scalars — backslashes are literal, regex stays readable
+- Each rule has a `reason` field that appears in audit logs
+
+**Why not OPA (Open Policy Agent) for Day 2?**
+
+OPA is the production-grade choice for complex, multi-tenant policy engines. It uses Rego — a declarative policy language — and runs as a sidecar. Day 2 doesn't need that complexity:
+
+| Concern | Day 2 (YAML+Python) | OPA |
+|---------|---------------------|-----|
+| Setup | Zero (file read) | Binary + Rego syntax |
+| Expressiveness | Regex + length rules | Full Turing-complete policies |
+| Testability | Standard pytest | OPA test suite |
+| Migration path | YAML → Rego is straightforward | — |
+
+The Python policy engine is a drop-in replacement placeholder. If rule complexity grows (multi-role policies, time-based rules, contextual decisions), the migration to OPA is: replace `ScopeValidator.__init__` and `validate()`, keep the YAML schema.
+
+**Fail-open design (intentional contrast with Layer 2)**
+
+If the policy file is missing, `ScopeValidator` logs a warning and passes all inputs. This is the opposite of Layer 2's fail-closed behavior — and it's intentional:
+- Layer 2 (security): fail closed. Unknown = potentially dangerous.
+- Layer 3 (scope): fail open. An unknown scope is permissive, not a security threat. A missing policy file is a configuration problem, not a reason to block all user requests.
+
+**Interview questions this answers:**
+- "What's the difference between a security check and a scope check?"
+- "Why not use OPA for your policy engine?"
+- "Why does Layer 3 fail open but Layer 2 fails closed?"
+
+---
+
+### 3.3 Pipeline Routing — Why Each Layer Fires When It Does
+
+```
+Input
+  │
+  ▼
+Layer 1: Pattern Matcher (always, <1ms, free)
+  │
+  ├─ MALICIOUS ──────────────────────────────────► BLOCK (short-circuit)
+  │                                                 L2 + L3 never called
+  │
+  ├─ SUSPICIOUS ──────────────────────────────────► Layer 2
+  │                                                   │
+  │                                        ┌──────────┴──────────┐
+  │                                    MALICIOUS              SAFE / SUSPICIOUS
+  │                                        │                      │
+  │                                      BLOCK                 Layer 3
+  │                                                               │
+  └─ SAFE ────────────────────────────────────────────► Layer 3   │
+                                                          │        │
+                                                  out_of_scope   in_scope
+                                                       │              │
+                                                  SUSPICIOUS        SAFE
+```
+
+**The cost model behind this routing:**
+
+| Case | L1 | L2 | L3 | API calls |
+|------|----|----|----|-----------|
+| Clean business query | SAFE | — | passes | 0 |
+| Known attack (DAN, etc.) | MALICIOUS | — | — | 0 |
+| Borderline → LLM says MALICIOUS | SUSPICIOUS | MALICIOUS | — | 1 (or 0 if cached) |
+| Borderline → LLM says SAFE | SUSPICIOUS | SAFE | passes | 1 (or 0 if cached) |
+| Out-of-scope (DROP TABLE) | SAFE | — | flagged | 0 |
+
+The vast majority of traffic hits the "0 API calls" paths. Claude is only charged for genuine ambiguous inputs, and even those are cached after first occurrence.
+
+**Interview questions this answers:**
+- "How do you optimize your security pipeline for cost?"
+- "What is your system's latency profile?"
+- "Walk me through what happens when a clean vs. malicious input enters the system."
+
+---
+
+## 4. Interview Q&A Bank
 
 ### Architecture Questions
 
@@ -494,7 +668,31 @@ A: "The patterns are static config — they don't change per-request and don't n
 
 ---
 
-## 4. Key Concepts Glossary
+**Q: "How does your ChromaDB cache reduce API costs?"**
+
+A: "Every time Claude classifies an input, we embed the normalized text and store the verdict in ChromaDB. Before the next API call, we query the collection for cosine-similar inputs. If the closest stored entry has cosine distance less than 0.08 — meaning semantic similarity above 92% — we return the cached verdict without calling Claude. This means the same attack rephrased slightly ('ignore all instructions' vs 'disregard all instructions') hits the cache on the second occurrence. In steady state, the LLM classifier is only paid for genuinely novel attack variants."
+
+---
+
+**Q: "What's the difference between your Layer 2 and Layer 3 checks?"**
+
+A: "Layer 2 answers 'is this an attack?' — it uses Claude to classify semantic intent. Layer 3 answers 'even if it's not an attack, is this within scope?' — it checks against a YAML policy that defines what the protected agent is allowed to do. A SQL DROP TABLE statement isn't a prompt injection, but it's still something a business assistant shouldn't handle. Layer 2 would clear it as SAFE; Layer 3 flags it as out-of-scope. These are different failure modes that need different checks."
+
+---
+
+**Q: "Why does Layer 2 fail closed but Layer 3 fail open?"**
+
+A: "They have different safety contracts. Layer 2 is a security gate — if it's unavailable, an uncertain input should stay uncertain (SUSPICIOUS), not be cleared as safe. Failing open on security means attackers can knock out your classifier and get through. Layer 3 is a scope gate — if the policy file is missing, that's a configuration mistake, not a security threat. Blocking all traffic because a YAML file is missing would be a denial-of-service against legitimate users. Scope failures are operational problems; security failures are adversarial problems. They get opposite defaults."
+
+---
+
+**Q: "How would you migrate the scope validator to OPA?"**
+
+A: "The ScopeValidator interface is `validate(input_text, context) → {out_of_scope, reason, rule_triggered}`. To migrate to OPA, I'd replace the `__init__` and `validate` methods — the YAML policy schema maps cleanly to Rego rules, and the interface contract is unchanged. The rest of the pipeline doesn't know or care whether policies are evaluated by Python regex or OPA. I built it this way deliberately — start simple, isolate the implementation behind an interface, migrate when complexity warrants it."
+
+---
+
+## 5. Key Concepts Glossary
 
 | Term | Definition |
 |------|-----------|
@@ -522,7 +720,17 @@ A: "The patterns are static config — they don't change per-request and don't n
 | **Obfuscation Boost** | +10% confidence per obfuscation layer detected — encoding itself is treated as an attack signal |
 | **Sigma Rules** | Industry standard YAML format for security detection rules (SIEM); inspiration for our YAML pattern storage |
 | **Word-level Heuristic** | Leet normalization strategy requiring ≥2 alpha chars per token to avoid false positives on "Q3", "v2.0" |
+| **LLMClassifier** | Layer 2: Claude Haiku classifier with ChromaDB semantic cache — only fires on SUSPICIOUS inputs |
+| **ScopeValidator** | Layer 3: YAML-policy engine that checks SAFE inputs for out-of-scope requests (DROP TABLE, credentials, etc.) |
+| **Semantic Cache** | Vector database (ChromaDB) storing LLM verdicts by embedding — cache hit when cosine similarity > 0.92 |
+| **Cache Hit Distance** | Cosine distance threshold (0.08) below which a cached verdict is returned without calling the API |
+| **Fail-Closed** | Default behavior when a security component is unavailable: return SUSPICIOUS, never SAFE |
+| **Fail-Open** | Default behavior when a scope component is unavailable: pass all inputs, log warning |
+| **Scope Policy** | YAML file defining what the protected agent is allowed to do (max length, forbidden patterns) |
+| **all-MiniLM-L6-v2** | ChromaDB default embedding model; 384-dimension vectors, downloads automatically on first run |
+| **Pipeline Short-Circuit** | Layer 1 MALICIOUS returns immediately — Layers 2 and 3 are never called, saving latency and cost |
+| **Rego** | OPA's declarative policy language; planned for the hardening phase (Day 10-14) as ScopeValidator replacement |
 
 ---
 
-*Last updated: Day 1 complete — Encoding hardening (hex/base64/leet/unicode), typoglycemia detection, YAML pattern storage, preprocessor module extraction. Merged to main. 35/35 tests passing.*
+*Last updated: Day 2 complete — Layer 2 (LLM Classifier + ChromaDB semantic cache), Layer 3 (YAML scope validator), pipeline routing logic, fail-closed/fail-open design. 59/59 tests passing.*
