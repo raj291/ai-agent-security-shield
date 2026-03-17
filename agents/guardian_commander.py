@@ -143,42 +143,137 @@ def input_guard_node(state: GuardianState) -> dict:
 
 def memory_guard_node(state: GuardianState) -> dict:
     """
-    LangGraph node for document ingestion via Memory Guard.
+    LangGraph node for document scanning via Memory Guard (Day 3+).
 
-    Called when state contains a 'document_to_ingest' key (Day 3+).
-    Scans the document for RAG poisoning before it enters the knowledge base.
+    Handles two document types:
+      - 'text': plain text or extracted document content
+      - 'pdf':  file path → PyMuPDF extracts ALL text including hidden content
 
-    For regular user messages (no document), this node is skipped.
+    Flow:
+      1. Extract content (PDF path → fitz, or plain text as-is)
+      2. Scan with MemoryScanner (patterns + semantic attack similarity)
+      3. Context window assessment (displacement risk)
+      4. If POISONED → block; if SUSPICIOUS → sanitize; if CLEAN → pass
+      5. Log to audit trail
+
+    State keys read:
+      document_to_ingest  : str  — Document text OR PDF file path
+      document_id         : str  — Identifier for logging
+      document_type       : str  — 'text' (default) or 'pdf'
+      user_input          : str  — Used for context window assessment
+
+    State keys written:
+      memory_guard_result : dict — Full scan result
+      is_blocked          : bool — True if POISONED document
+      sanitized_input     : str  — Sanitized content (SUSPICIOUS documents)
+      audit_log           : list — Updated audit trail
     """
     from guards.memory_guard import MemoryGuard
 
     doc_content = state.get("document_to_ingest", "")
     doc_id      = state.get("document_id", "unknown")
+    doc_type    = state.get("document_type", "text")
 
     if not doc_content:
         logger.debug("[MemoryGuardNode] No document to scan — skipping")
         return {}
 
-    guard  = MemoryGuard()
-    result = guard.scan_for_graph(doc_content, doc_id=doc_id)
+    guard = MemoryGuard()
+    updates: dict = {}
 
+    # ── Step 1: PDF path or plain text ────────────────────────────────────────
+    if doc_type == "pdf":
+        # doc_content is a file path for PDFs
+        pdf_result, scan_result = guard.scan_pdf(doc_content)
+        result = {
+            "guard":             "memory_guard",
+            "verdict":           scan_result.verdict,
+            "confidence":        scan_result.confidence,
+            "threat_categories": scan_result.threat_categories,
+            "threats_found":     len(scan_result.threats),
+            "obfuscation":       scan_result.obfuscation_methods,
+            "metadata_threats":  scan_result.metadata_threats,
+            "scan_note":         scan_result.scan_note,
+            "doc_id":            doc_id,
+            "doc_type":          "pdf",
+            "hidden_spans":      pdf_result.hidden_span_count,
+            "hidden_text":       pdf_result.hidden_text[:300] if pdf_result.hidden_text else "",
+            "pdf_scan_notes":    pdf_result.scan_notes,
+        }
+        if scan_result.verdict in ("SUSPICIOUS", "POISONED") and scan_result.sanitized_content:
+            updates["sanitized_input"] = scan_result.sanitized_content
+    else:
+        # Plain text document
+        scan_result = guard.scan_document(doc_content, doc_id=doc_id, doc_type="text")
+        result = {
+            "guard":             "memory_guard",
+            "verdict":           scan_result.verdict,
+            "confidence":        scan_result.confidence,
+            "threat_categories": scan_result.threat_categories,
+            "threats_found":     len(scan_result.threats),
+            "obfuscation":       scan_result.obfuscation_methods,
+            "metadata_threats":  scan_result.metadata_threats,
+            "scan_note":         scan_result.scan_note,
+            "doc_id":            doc_id,
+            "doc_type":          "text",
+        }
+        if scan_result.verdict in ("SUSPICIOUS", "POISONED") and scan_result.sanitized_content:
+            updates["sanitized_input"] = scan_result.sanitized_content
+
+    # ── Step 2: Context window displacement check ──────────────────────────────
+    system_prompt_hint = "You are a helpful, secure AI assistant."  # conservative default
+    ctx_assessment = guard.assess_context(
+        system_prompt=system_prompt_hint,
+        document=doc_content if doc_type == "text" else "",
+        model_limit=200_000,
+    )
+    result["context_risk"]        = ctx_assessment.displacement_risk
+    result["context_safe"]        = ctx_assessment.safe_to_process
+    result["context_doc_tokens"]  = ctx_assessment.document_tokens
+    result["context_recommendation"] = ctx_assessment.recommendation
+
+    # Context stuffing attack: CRITICAL displacement → escalate verdict
+    if ctx_assessment.displacement_risk == "CRITICAL" and result["verdict"] == "CLEAN":
+        result["verdict"]    = "SUSPICIOUS"
+        result["scan_note"] += f" | Context stuffing: {ctx_assessment.displacement_risk}"
+        logger.warning(
+            f"[MemoryGuardNode] Context stuffing risk CRITICAL — escalating to SUSPICIOUS | "
+            f"doc_tokens={ctx_assessment.document_tokens:,} | doc={doc_id}"
+        )
+
+    # ── Step 3: Block if POISONED ──────────────────────────────────────────────
+    is_poisoned = result["verdict"] == "POISONED"
+    if is_poisoned:
+        updates["is_blocked"] = True
+        logger.warning(
+            f"[MemoryGuardNode] BLOCKED POISONED DOCUMENT | "
+            f"doc={doc_id} | conf={result['confidence']:.2f} | "
+            f"categories={result['threat_categories']}"
+        )
+
+    # ── Audit ─────────────────────────────────────────────────────────────────
     audit_entry = {
-        "event":          "MEMORY_GUARD_SCAN",
-        "verdict":        result["verdict"],
-        "confidence":     result["confidence"],
-        "doc_id":         doc_id,
-        "threats_found":  result.get("threats_found", 0),
+        "event":         "MEMORY_GUARD_SCAN",
+        "verdict":       result["verdict"],
+        "confidence":    result["confidence"],
+        "doc_id":        doc_id,
+        "doc_type":      doc_type,
+        "threats_found": result["threats_found"],
+        "context_risk":  ctx_assessment.displacement_risk,
+        "blocked":       is_poisoned,
     }
-
     current_log = state.get("audit_log", [])
+
     logger.info(
         f"[MemoryGuardNode] verdict={result['verdict']} | "
-        f"doc={doc_id} | conf={result['confidence']:.2f}"
+        f"doc={doc_id} | conf={result['confidence']:.2f} | "
+        f"context_risk={ctx_assessment.displacement_risk}"
     )
 
     return {
         "memory_guard_result": result,
         "audit_log": current_log + [audit_entry],
+        **updates,
     }
 
 

@@ -1,13 +1,13 @@
 """
 Memory Guard — Public API
 
-Prevents RAG poisoning and memory injection attacks.
+Intercepts documents (PDFs, text) BEFORE they reach the LLM.
+Extracts all content including hidden text, detects attacks, and either:
+  - MALICIOUS → block, sanitize, store attack variant in knowledge base
+  - CLEAN → pass full text to the LLM/protected agent node
 
-Two threats stopped here:
-  1. Document-level injection: Attacker uploads a document containing
-     hidden LLM instructions that execute when retrieved.
-  2. Retrieval-time injection: A previously stored doc has since been
-     modified (or a new poisoned doc was sneaked in) and gets retrieved.
+ChromaDB stores only ATTACK examples (never clean documents).
+When a new attack is found, it's stored for future semantic detection.
 
 Usage
 -----
@@ -15,28 +15,29 @@ Usage
 
     mg = MemoryGuard()
 
-    # Ingest a new document
-    add_result = mg.add_document(
-        content="Our refund policy is 30 days...",
-        doc_id="policy_001",
-        metadata={"source": "internal_wiki", "author": "legal_team"},
-    )
-    # add_result.stored = True/False
-    # add_result.verdict = "CLEAN" / "SUSPICIOUS" / "POISONED"
+    # Scan plain text
+    result = mg.scan_document("document text here", doc_id="doc_001")
+    if result.verdict == "CLEAN":
+        pass_to_llm(result.sanitized_input or text)
+    else:
+        block_and_alert(result)
 
-    # RAG retrieval (safe)
-    retrieve_result = mg.retrieve("What is our refund policy?", k=5)
-    # retrieve_result.chunks = [RetrievedChunk, ...]
-    # Each chunk is pre-scanned; poisoned chunks are excluded
+    # Scan a PDF file (extracts hidden text automatically)
+    pdf_result, scan_result = mg.scan_pdf("/path/to/report.pdf")
+    # pdf_result.hidden_text shows what was hidden
+    # scan_result.verdict is the security decision
 
-    # Scan a standalone document (no storage)
-    scan_result = mg.scan_document("document text here", doc_id="scan_only")
-    # scan_result.verdict = "CLEAN" / "SUSPICIOUS" / "POISONED"
+    # Check context window (prevent displacement attacks)
+    ctx = mg.assess_context(system_prompt="...", document="large doc text")
+    if not ctx.safe_to_process:
+        truncate(document)
 """
-from .memory_scanner import MemoryScanner, ScanResult, DocumentThreat
-from .rag_store import RagStore, AddResult, RetrieveResult, RetrievedChunk
-
 import logging
+
+from .memory_scanner import MemoryScanner, ScanResult, DocumentThreat
+from .attack_store import AttackStore, AttackSimilarityResult
+from .pdf_scanner import PdfScanner, PdfScanResult
+from .context_monitor import ContextWindowMonitor, ContextAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -45,62 +46,117 @@ class MemoryGuard:
     """
     The Memory Guard — Day 3 of the AI Agent Security Shield.
 
-    Wraps MemoryScanner + RagStore into a single clean interface
-    for the Guardian Commander to call.
+    Scans documents for:
+      1. Regex attack patterns (via MemoryScanner, 91+ patterns)
+      2. Semantic similarity to known attacks (via AttackStore, ChromaDB)
+      3. Hidden text in PDFs (via PdfScanner, PyMuPDF)
+      4. Context window displacement risk (via ContextWindowMonitor)
+
+    If a new attack is detected, it is stored in the attack knowledge base
+    so future semantically similar attacks are caught faster.
     """
 
     def __init__(self):
-        self._scanner  = MemoryScanner()
-        self._rag      = RagStore()
-        logger.info("[MemoryGuard] Online | scanner=ready | rag_store=ready")
+        self._scanner = MemoryScanner()
+        self._attack_store = AttackStore()
+        self._pdf_scanner = PdfScanner()
+        self._ctx_monitor = ContextWindowMonitor()
+        logger.info("[MemoryGuard] Online | scanner + attack_store + pdf_scanner + ctx_monitor")
 
-    # ── Document lifecycle ────────────────────────────────────────────────────
-
-    def add_document(
-        self,
-        content:  str,
-        doc_id:   str | None  = None,
-        metadata: dict | None = None,
-    ) -> AddResult:
-        """
-        Ingest a document into the knowledge base.
-
-        Internally: MemoryScanner → block/sanitize → RagStore.add_document()
-        """
-        return self._rag.add_document(content, doc_id=doc_id, metadata=metadata)
-
-    def retrieve(self, query: str, k: int = 5) -> RetrieveResult:
-        """
-        Retrieve documents relevant to a query.
-
-        Internally: ChromaDB.query() → MemoryScanner on each chunk → filter
-        Returns only CLEAN or SUSPICIOUS (sanitized) chunks.
-        """
-        return self._rag.retrieve(query, k=k)
-
-    def delete_document(self, doc_id: str) -> bool:
-        """Remove a document from the knowledge base."""
-        return self._rag.delete_document(doc_id)
-
-    # ── Standalone scan (no storage) ─────────────────────────────────────────
+    # ── Document scanning ─────────────────────────────────────────────────────
 
     def scan_document(
         self,
-        content:  str,
-        doc_id:   str = "scan_only",
+        content: str,
+        doc_id: str = "doc",
+        doc_type: str = "text",
         metadata: dict | None = None,
     ) -> ScanResult:
         """
-        Scan a document without storing it.
+        Scan a document for attack content.
 
-        Use when you want to inspect a document but not ingest it
-        (e.g. incoming email attachments, API responses, external feeds).
+        Parameters
+        ----------
+        content  : str  — Document text to scan
+        doc_id   : str  — Identifier for audit log
+        doc_type : str  — "text" (default) or "pdf" (auto-detected if content is bytes)
+        metadata : dict — Optional metadata to inspect for injection
+
+        Returns
+        -------
+        ScanResult with verdict: "CLEAN" / "SUSPICIOUS" / "POISONED"
         """
-        return self._scanner.scan(content, doc_id=doc_id, metadata=metadata)
+        result = self._scanner.scan(content, doc_id=doc_id, metadata=metadata)
+
+        # If MALICIOUS/SUSPICIOUS: grow the attack knowledge base
+        if result.verdict in ("SUSPICIOUS", "POISONED") and result.threats:
+            top_category = result.threat_categories[0] if result.threat_categories else "unknown"
+            self._attack_store.store_new_attack(
+                text=content[:500],  # store first 500 chars as the attack signature
+                category=top_category,
+                metadata={
+                    "doc_id": doc_id,
+                    "verdict": result.verdict,
+                    "confidence": str(result.confidence),
+                    "patterns": ",".join(t.pattern_name for t in result.threats[:3]),
+                },
+            )
+
+        return result
+
+    def scan_pdf(self, file_path: str) -> tuple[PdfScanResult, ScanResult]:
+        """
+        Scan a PDF file — extracts ALL text including hidden content, then scans.
+
+        Returns
+        -------
+        (PdfScanResult, ScanResult)
+          PdfScanResult: what PyMuPDF found (visible text, hidden text, OCG layers)
+          ScanResult:    security verdict on the combined text
+        """
+        pdf_result = self._pdf_scanner.scan_file(file_path)
+
+        # Scan the FULL text (visible + hidden) — the hidden part is the attack surface
+        scan_result = self.scan_document(
+            content=pdf_result.all_text,
+            doc_id=file_path,
+            doc_type="pdf",
+        )
+
+        # If PDF had hidden content but no pattern matches, boost confidence
+        if pdf_result.has_hidden_content and scan_result.confidence < 0.30:
+            # Hidden text in a PDF is suspicious even without explicit injection patterns
+            logger.warning(
+                f"[MemoryGuard] PDF has hidden content but no injection patterns | "
+                f"doc={file_path} | hidden_spans={pdf_result.hidden_span_count}"
+            )
+
+        return pdf_result, scan_result
+
+    # ── Context window monitoring ─────────────────────────────────────────────
+
+    def assess_context(
+        self,
+        system_prompt: str,
+        document: str,
+        model_limit: int = 200_000,
+    ) -> ContextAssessment:
+        """
+        Check if processing this document would displace the system prompt.
+
+        A context stuffing attack submits a huge document to push the system
+        prompt far from the active context window position.
+        """
+        return self._ctx_monitor.assess(system_prompt, document, model_limit)
 
     # ── LangGraph node interface ──────────────────────────────────────────────
 
-    def scan_for_graph(self, content: str, doc_id: str = "graph_doc") -> dict:
+    def scan_for_graph(
+        self,
+        content: str,
+        doc_id: str = "graph_doc",
+        doc_type: str = "text",
+    ) -> dict:
         """
         LangGraph-compatible interface.
 
@@ -108,31 +164,27 @@ class MemoryGuard:
         """
         scan = self._scanner.scan(content, doc_id=doc_id)
         return {
-            "guard":            "memory_guard",
-            "verdict":          scan.verdict,
-            "confidence":       scan.confidence,
-            "threat_categories": scan.threat_categories,
-            "threats_found":    len(scan.threats),
-            "obfuscation":      scan.obfuscation_methods,
-            "metadata_threats": scan.metadata_threats,
-            "scan_note":        scan.scan_note,
-            "doc_id":           doc_id,
+            "guard":              "memory_guard",
+            "verdict":            scan.verdict,
+            "confidence":         scan.confidence,
+            "threat_categories":  scan.threat_categories,
+            "threats_found":      len(scan.threats),
+            "obfuscation":        scan.obfuscation_methods,
+            "metadata_threats":   scan.metadata_threats,
+            "scan_note":          scan.scan_note,
+            "doc_id":             doc_id,
         }
-
-    # ── Stats ─────────────────────────────────────────────────────────────────
-
-    def stats(self) -> dict:
-        """Return knowledge base statistics."""
-        return self._rag.stats()
 
 
 __all__ = [
     "MemoryGuard",
     "MemoryScanner",
-    "RagStore",
+    "AttackStore",
+    "PdfScanner",
+    "ContextWindowMonitor",
     "ScanResult",
     "DocumentThreat",
-    "AddResult",
-    "RetrieveResult",
-    "RetrievedChunk",
+    "AttackSimilarityResult",
+    "PdfScanResult",
+    "ContextAssessment",
 ]

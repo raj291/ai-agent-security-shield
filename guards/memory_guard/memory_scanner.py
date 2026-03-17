@@ -33,6 +33,11 @@ Architecture
              ← suspicious_metadata_keys from memory_patterns.yaml
                         │
                         ▼
+           Semantic Attack Check (Step 3.5)
+           ← ChromaDB "rag_attack_examples" (35+ known attacks)
+           ← cosine distance < 0.25 = semantically attack-like
+                        │
+                        ▼
            Document Density Analysis
            ← invisible char density >1% = suspicious
            ← whitespace:content ratio anomaly
@@ -266,6 +271,27 @@ class MemoryScanner:
             if t.pattern_name not in seen or t.severity > seen[t.pattern_name].severity:
                 seen[t.pattern_name] = t
         result.threats = list(seen.values())
+
+        # ── 3.5. Semantic similarity check against attack knowledge base ──────
+        # ChromaDB vector search: is this text semantically similar to known attacks?
+        # Fails safely — if ChromaDB is unavailable, scanning continues normally.
+        try:
+            from .attack_store import AttackStore
+            atk = AttackStore().semantic_check(scan_content)
+            if atk.is_attack_like:
+                result.threats.append(DocumentThreat(
+                    pattern_name="semantic_attack_similarity",
+                    category="semantic",
+                    severity=atk.confidence_contribution,
+                    matched_text=(
+                        f"~{atk.nearest_attack_category} attack "
+                        f"(distance={atk.distance:.3f})"
+                    ),
+                    detected_via="chromadb_semantic",
+                ))
+        except Exception as exc:
+            logger.warning(f"[MemoryScanner] Attack store unavailable: {exc}")
+            # Never fail the scanner due to ChromaDB being unavailable
 
         # ── 4. Typoglycemia check ──────────────────────────────────────────
         result.typoglycemia_hits = self._typo_detector.check(scan_content)
