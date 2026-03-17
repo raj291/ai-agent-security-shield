@@ -14,7 +14,13 @@ Architecture: LangGraph StateGraph
   - Edges define the routing logic
   - Conditional edges allow dynamic routing based on state
 
-Day 1: Commander does routing only. Logic added each day as guards are built.
+Graph topology (Day 3):
+  START → input_guard → guardian_commander → [END | protected_agent] → END
+  Documents also routed through → memory_guard_node (RAG ingestion path)
+
+Day 1: Input Guard Layer 1 (pattern matching)
+Day 2: Input Guard Layer 2 (LLM classifier) + Layer 3 (scope validator)
+Day 3: Memory Guard (RAG poisoning prevention)
 """
 import uuid
 import logging
@@ -135,6 +141,47 @@ def input_guard_node(state: GuardianState) -> dict:
 # The agent being protected — simulated for now
 # ─────────────────────────────────────────────
 
+def memory_guard_node(state: GuardianState) -> dict:
+    """
+    LangGraph node for document ingestion via Memory Guard.
+
+    Called when state contains a 'document_to_ingest' key (Day 3+).
+    Scans the document for RAG poisoning before it enters the knowledge base.
+
+    For regular user messages (no document), this node is skipped.
+    """
+    from guards.memory_guard import MemoryGuard
+
+    doc_content = state.get("document_to_ingest", "")
+    doc_id      = state.get("document_id", "unknown")
+
+    if not doc_content:
+        logger.debug("[MemoryGuardNode] No document to scan — skipping")
+        return {}
+
+    guard  = MemoryGuard()
+    result = guard.scan_for_graph(doc_content, doc_id=doc_id)
+
+    audit_entry = {
+        "event":          "MEMORY_GUARD_SCAN",
+        "verdict":        result["verdict"],
+        "confidence":     result["confidence"],
+        "doc_id":         doc_id,
+        "threats_found":  result.get("threats_found", 0),
+    }
+
+    current_log = state.get("audit_log", [])
+    logger.info(
+        f"[MemoryGuardNode] verdict={result['verdict']} | "
+        f"doc={doc_id} | conf={result['confidence']:.2f}"
+    )
+
+    return {
+        "memory_guard_result": result,
+        "audit_log": current_log + [audit_entry],
+    }
+
+
 def protected_agent_node(state: GuardianState) -> dict:
     """
     Represents the AI agent being protected.
@@ -199,14 +246,16 @@ def build_guardian_graph() -> CompiledStateGraph:
 
     # Register nodes
     graph.add_node("input_guard", input_guard_node)
+    graph.add_node("memory_guard", memory_guard_node)   # Day 3
     graph.add_node("guardian_commander", guardian_commander_node)
     graph.add_node("protected_agent", protected_agent_node)
 
     # Entry point: all requests start at input_guard
     graph.set_entry_point("input_guard")
 
-    # input_guard → guardian_commander (always)
-    graph.add_edge("input_guard", "guardian_commander")
+    # input_guard → memory_guard (document scans run in sequence) → guardian_commander
+    graph.add_edge("input_guard", "memory_guard")
+    graph.add_edge("memory_guard", "guardian_commander")
 
     # guardian_commander → conditional routing
     graph.add_conditional_edges(

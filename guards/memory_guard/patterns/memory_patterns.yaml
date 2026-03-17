@@ -1,0 +1,166 @@
+# Memory Guard — Document-Context Attack Patterns
+#
+# These patterns detect prompt injection embedded INSIDE documents that
+# will be retrieved via RAG and injected into the LLM's context.
+#
+# Different from Input Guard patterns:
+#   - Input Guard: user message → LLM
+#   - Memory Guard: stored document → retrieved → injected into context
+#
+# YAML note: All regex values use single-quoted scalars (backslashes literal).
+# Avoid embedded single-quotes and \u sequences — use character classes instead.
+
+categories:
+
+  # ── Category 1: Retrieval-Triggered Instructions ─────────────────────────
+  retrieval_triggered:
+    description: 'Instructions that activate when the document is retrieved'
+    patterns:
+      - name: when_retrieved_instruction
+        regex: 'when\s+(this\s+)?(document|text|content|file|record)\s+is\s+(retrieved|accessed|read|loaded|used)'
+        severity: 1.0
+
+      - name: if_retrieved_instruction
+        regex: 'if\s+(this\s+)?(document|text|content|file)\s+(is\s+)?(retrieved|returned|found|accessed)'
+        severity: 1.0
+
+      - name: upon_retrieval
+        regex: 'upon\s+(retrieval|being\s+retrieved|access|being\s+accessed)'
+        severity: 1.0
+
+      - name: when_context_loaded
+        regex: 'when\s+(added\s+to|included\s+in|injected\s+into)\s+(context|prompt|conversation)'
+        severity: 1.0
+
+      - name: dear_ai_in_doc
+        regex: '(dear|hello|attention|note\s+to)\s+(AI|LLM|GPT|Claude|assistant|language\s+model)'
+        severity: 0.9
+
+  # ── Category 2: Instruction Override via Document ────────────────────────
+  document_instruction_override:
+    description: 'System prompt or instruction overrides embedded in documents'
+    patterns:
+      - name: ignore_in_document
+        regex: 'ignore\s+(all\s+)?(previous|prior|above|your|system|original)\s+(instructions?|prompts?|rules?|guidelines?|constraints?)'
+        severity: 1.0
+
+      - name: disregard_in_document
+        regex: 'disregard\s+(all\s+)?(previous|prior|above|your|system|original)\s+(instructions?|prompts?|rules?|training)'
+        severity: 1.0
+
+      - name: new_instructions_override
+        regex: '(your\s+)?(new|updated|actual|real|true)\s+instructions?\s+(are|follow|below|start)'
+        severity: 1.0
+
+      - name: system_prompt_injection
+        regex: '\[SYSTEM\]|\[INST\]|\[\/INST\]|<<SYS>>|<\|system\|>'
+        severity: 1.0
+
+      - name: role_override_in_doc
+        regex: 'you\s+are\s+now\s+(a\s+|an\s+)?(different|new|another|uncensored|unrestricted|jailbroken)'
+        severity: 0.9
+
+      - name: forget_instructions
+        regex: 'forget\s+(everything|all|your)\s+(you\s+know|previous|prior|above|been\s+told)'
+        severity: 0.9
+
+  # ── Category 3: Hidden Content Indicators ────────────────────────────────
+  hidden_content:
+    description: 'Patterns suggesting content hidden from human readers'
+    patterns:
+      - name: html_display_none
+        regex: 'display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0px|opacity\s*:\s*0'
+        severity: 0.8
+
+      - name: white_on_white_color
+        regex: '(color|colour)\s*:\s*(white|#fff|#ffffff|rgb\s*\(\s*255\s*,\s*255\s*,\s*255)'
+        severity: 0.8
+
+      - name: comment_injection
+        regex: '<!--.*?(ignore|disregard|override|instruction|system\s+prompt).*?-->'
+        severity: 0.9
+
+  # ── Category 4: Exfiltration via Retrieved Context ───────────────────────
+  context_exfiltration:
+    description: 'Attempts to extract system information through retrieved context'
+    patterns:
+      - name: repeat_system_prompt
+        regex: 'repeat\s+(the\s+)?(system\s+prompt|your\s+instructions?|your\s+prompt|what\s+you\s+were\s+told)'
+        severity: 1.0
+
+      - name: reveal_context
+        regex: 'reveal\s+(the\s+)?(context|system\s+prompt|instructions?|confidential|secret|hidden)'
+        severity: 1.0
+
+      - name: print_above_context
+        regex: '(print|output|display|show|echo)\s+(everything|all\s+text|the\s+prompt|context\s+above)'
+        severity: 0.9
+
+      - name: leak_document_names
+        regex: '(list|name|reveal|show)\s+all\s+(documents?|files?|sources?|chunks?)\s+(in\s+)?(the\s+)?(database|store|index|knowledge\s+base)'
+        severity: 0.8
+
+  # ── Category 5: Persona Hijack via Document ──────────────────────────────
+  persona_hijack:
+    description: 'Persona manipulation embedded in document content'
+    patterns:
+      - name: dan_in_document
+        regex: 'DAN\s*(mode|activated?|enabled?|protocol)|\bdo\s+anything\s+now\b'
+        severity: 1.0
+
+      - name: jailbreak_in_document
+        regex: 'jailbreak(ed?|ing|mode)|\bunrestricted\s+mode\b|\bno\s+restrictions?\s+mode\b'
+        severity: 1.0
+
+      - name: pretend_no_restrictions
+        regex: 'pretend\s+(you\s+have\s+no|you\s+don.t\s+have\s+any|there\s+are\s+no)\s+(rules?|restrictions?|limits?|guidelines?|filters?)'
+        severity: 0.9
+
+      - name: act_as_evil_ai
+        regex: 'act\s+as\s+(an?\s+)?(evil|unrestricted|uncensored|unfiltered|malicious|hacked)\s+(AI|assistant|model|version)'
+        severity: 1.0
+
+  # ── Category 6: Anomalous Document Structure ─────────────────────────────
+  structural_anomaly:
+    description: 'Document structure inconsistent with legitimate content'
+    patterns:
+      - name: prompt_delimiters_in_doc
+        regex: '###\s*(SYSTEM|HUMAN|AI|ASSISTANT|USER|INSTRUCTION)\s*###'
+        severity: 0.8
+
+      - name: markdown_instruction_block
+        regex: '^>\s*(IMPORTANT|CRITICAL|NOTE TO AI|AI INSTRUCTION|SYSTEM)\s'
+        severity: 0.7
+
+      - name: base64_block_in_doc
+        regex: '[A-Za-z0-9+/]{60,}={0,2}'
+        severity: 0.6
+
+      - name: suspicious_metadata_injection
+        regex: '(metadata|properties|tags)\s*[=:]\s*\{[^}]*(inject|override|instruction|ignore)[^}]*\}'
+        severity: 0.8
+
+
+# ── Typoglycemia keywords specific to document-embedded attacks ─────────────
+typoglycemia_keywords:
+  retrieved:    0.85
+  document:     0.70
+  retrieval:    0.85
+  context:      0.75
+  injected:     0.90
+  override:     0.90
+  disregard:    0.90
+
+
+# ── Suspicious metadata keys ─────────────────────────────────────────────────
+suspicious_metadata_keys:
+  - instruction
+  - override
+  - inject
+  - system_prompt
+  - ignore
+  - bypass
+  - jailbreak
+  - hidden_instruction
+  - ai_note
+  - llm_note
