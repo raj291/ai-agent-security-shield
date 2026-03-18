@@ -52,10 +52,16 @@ class GuardianState(TypedDict):
     # Format: {tool_name, agent_role, session_id, parameters}
     pending_tool_call: Optional[dict]       # Tool call awaiting validation
 
+    # --- Output Guard (Day 5) ---
+    # system_prompt: registered at session start for leakage detection.
+    # agent_response: raw output from protected_agent before Output Guard filtering.
+    system_prompt: Optional[str]            # System prompt (for prompt leak detection)
+    agent_response: Optional[str]           # Raw agent output before sanitization
+
     # --- Commander Decision ---
     threat_severity: ThreatSeverity         # Commander's severity assessment
     action_taken: str                       # What action was executed
-    response_to_user: str                   # Final message back to user
+    response_to_user: str                   # Final message back to user (post Output Guard)
 
     # --- Metadata ---
     session_id: str

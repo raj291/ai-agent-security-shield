@@ -14,13 +14,15 @@ Architecture: LangGraph StateGraph
   - Edges define the routing logic
   - Conditional edges allow dynamic routing based on state
 
-Graph topology (Day 4):
-  START → input_guard → memory_guard → tool_guard → guardian_commander → [END | protected_agent] → END
+Graph topology (Day 5):
+  START → input_guard → memory_guard → tool_guard → guardian_commander
+        → [END if blocked | protected_agent → output_guard] → END
 
 Day 1: Input Guard Layer 1 (pattern matching)
 Day 2: Input Guard Layer 2 (LLM classifier) + Layer 3 (scope validator)
 Day 3: Memory Guard (RAG poisoning prevention)
 Day 4: Tool Guard (least-privilege tool proxy)
+Day 5: Output Guard (PII + secrets + entropy + prompt leak detection)
 """
 import uuid
 import logging
@@ -83,10 +85,10 @@ def guardian_commander_node(state: GuardianState) -> dict:
 
     # Audit log entry
     audit_entry = {
-        "event": "COMMANDER_DECISION",
-        "verdict": verdict,
-        "severity": severity,
-        "action": action,
+        "event":      "COMMANDER_DECISION",
+        "verdict":    verdict,
+        "severity":   severity,
+        "action":     action,
         "confidence": confidence,
         "threat_type": input_result.get("threat_type"),
     }
@@ -342,21 +344,114 @@ def protected_agent_node(state: GuardianState) -> dict:
     """
     Represents the AI agent being protected.
     In a real deployment, this calls your actual agent logic.
-    For Day 1, it's a stub that echoes the (potentially sanitized) input.
+
+    Day 5 change: sets 'agent_response' (the raw output) instead of
+    directly writing to 'response_to_user'. The output_guard_node reads
+    'agent_response', scans it, and sets the final 'response_to_user'.
     """
     input_to_use = state.get("sanitized_input") or state["user_input"]
     logger.info(f"[ProtectedAgent] Processing: {input_to_use[:80]}...")
 
+    # Simulate the agent's raw response — in production this would call
+    # your actual LLM/agent logic. We echo the input for the stub.
+    raw_response = f"[Agent Response] Processed: {input_to_use[:100]}"
+
     audit_entry = {
-        "event": "AGENT_PROCESSED",
+        "event":        "AGENT_PROCESSED",
         "input_length": len(input_to_use),
     }
     current_log = state.get("audit_log", [])
 
     return {
-        "response_to_user": f"[Agent Response] Processed: {input_to_use[:100]}",
+        "agent_response":  raw_response,   # raw output, read by output_guard_node
+        "response_to_user": raw_response,  # default; overwritten by output_guard if needed
         "audit_log": current_log + [audit_entry],
     }
+
+
+def output_guard_node(state: GuardianState) -> dict:
+    """
+    LangGraph node that scans agent responses for data leakage (Day 5+).
+
+    Runs AFTER protected_agent_node. Skips silently if the request was
+    already blocked upstream (is_blocked=True) — the agent never ran,
+    so there is no response to scan.
+
+    Flow:
+      1. SensitiveDataScanner: redact API keys, DB strings, internal URLs
+      2. PIIDetector (Presidio): redact names, emails, SSNs, credit cards
+      3. EntropyAnalyzer: flag/remove encoded/steganographic data
+      4. PromptLeakDetector: block if response reproduces system prompt
+
+    State keys read:
+      agent_response : str  — Raw agent output to scan
+      system_prompt  : str  — Registered system prompt (for leak detection)
+      session_id     : str  — Used to namespace the prompt leak store
+      is_blocked     : bool — If True, skip entirely
+
+    State keys written:
+      output_guard_result : dict — Full scan result
+      response_to_user    : str  — Sanitized / blocked response
+      is_blocked          : bool — Set True if BLOCKED verdict
+      audit_log           : list — Updated audit trail
+    """
+    from guards.output_guard import OutputGuard
+
+    # Skip: request was blocked before reaching the agent
+    if state.get("is_blocked"):
+        logger.debug("[OutputGuardNode] Request was already blocked — skipping")
+        return {}
+
+    response = state.get("agent_response") or state.get("response_to_user", "")
+    if not response:
+        logger.debug("[OutputGuardNode] No agent response to scan — skipping")
+        return {}
+
+    guard = OutputGuard()
+    result = guard.scan(
+        response=response,
+        system_prompt=state.get("system_prompt"),
+        session_id=state.get("session_id"),
+    )
+
+    updates: dict = {"output_guard_result": result}
+
+    if result["verdict"] == "BLOCKED":
+        updates["response_to_user"] = (
+            "I'm sorry, but I cannot provide that response. "
+            "The Output Guard detected potential data leakage. "
+            "Please contact your administrator if you believe this is an error."
+        )
+        updates["is_blocked"] = True
+        logger.warning(
+            f"[OutputGuardNode] BLOCKED — system prompt leakage | "
+            f"confidence={result['confidence']:.2f}"
+        )
+
+    elif result["verdict"] == "REDACTED":
+        updates["response_to_user"] = result["redacted_response"]
+        logger.info(
+            f"[OutputGuardNode] REDACTED — {len(result['findings'])} finding(s) | "
+            f"threats={result['threat_type']}"
+        )
+
+    else:
+        logger.info("[OutputGuardNode] CLEAN — response passes")
+
+    # Audit entry
+    audit_entry = {
+        "event":          "OUTPUT_GUARD_SCAN",
+        "verdict":        result["verdict"],
+        "threat_type":    result.get("threat_type"),
+        "findings_count": len(result.get("findings", [])),
+        "confidence":     result["confidence"],
+        "pii_found":      result["pii_result"].get("found", False),
+        "secrets_found":  not result["secrets_result"].get("clean", True),
+        "entropy_flag":   result["entropy_result"].get("suspicious", False),
+    }
+    updates["audit_log"] = state.get("audit_log", []) + [audit_entry]
+
+    return updates
 
 
 # ─────────────────────────────────────────────
@@ -393,30 +488,33 @@ def build_guardian_graph() -> CompiledStateGraph:
     """
     Constructs and compiles the Guardian LangGraph StateGraph.
 
-    Graph topology (Day 1):
-      START → input_guard → guardian_commander → [END | protected_agent] → END
+    Graph topology (Day 5):
+      START → input_guard → memory_guard → tool_guard → guardian_commander
+            → [END if blocked | protected_agent → output_guard] → END
 
     Each arrow is an edge. Conditional edges use routing functions above.
     """
     graph = StateGraph(GuardianState)
 
     # Register nodes
-    graph.add_node("input_guard", input_guard_node)
-    graph.add_node("memory_guard", memory_guard_node)   # Day 3
-    graph.add_node("tool_guard", tool_guard_node)       # Day 4
+    graph.add_node("input_guard",        input_guard_node)
+    graph.add_node("memory_guard",       memory_guard_node)    # Day 3
+    graph.add_node("tool_guard",         tool_guard_node)      # Day 4
     graph.add_node("guardian_commander", guardian_commander_node)
-    graph.add_node("protected_agent", protected_agent_node)
+    graph.add_node("protected_agent",    protected_agent_node)
+    graph.add_node("output_guard",       output_guard_node)    # Day 5
 
-    # Entry point: all requests start at input_guard
+    # Entry point
     graph.set_entry_point("input_guard")
 
-    # Day 4 graph: input_guard → memory_guard → tool_guard → guardian_commander
-    # tool_guard returns {} when no pending_tool_call (silently passes through)
-    graph.add_edge("input_guard", "memory_guard")
+    # Pre-agent pipeline:
+    # input_guard → memory_guard → tool_guard → guardian_commander
+    # (memory_guard and tool_guard silently pass through when not applicable)
+    graph.add_edge("input_guard",  "memory_guard")
     graph.add_edge("memory_guard", "tool_guard")
-    graph.add_edge("tool_guard", "guardian_commander")
+    graph.add_edge("tool_guard",   "guardian_commander")
 
-    # guardian_commander → conditional routing
+    # commander → conditional: blocked → END, else → protected_agent
     graph.add_conditional_edges(
         "guardian_commander",
         route_after_commander,
@@ -426,8 +524,10 @@ def build_guardian_graph() -> CompiledStateGraph:
         }
     )
 
-    # protected_agent → END
-    graph.add_edge("protected_agent", END)
+    # Post-agent pipeline:
+    # protected_agent → output_guard → END
+    graph.add_edge("protected_agent", "output_guard")
+    graph.add_edge("output_guard",    END)
 
     return graph.compile()
 
@@ -446,33 +546,41 @@ class GuardianCommander:
         self.graph = build_guardian_graph()
         logger.info("[GuardianCommander] System initialized. All guards online.")
 
-    def process(self, user_input: str, session_id: str = None) -> dict:
+    def process(
+        self,
+        user_input: str,
+        session_id: str = None,
+        system_prompt: str = None,
+    ) -> dict:
         """
         Process a user input through the full Guardian pipeline.
 
         Args:
-            user_input: Raw text from the user
-            session_id: Optional session identifier for audit trail
+            user_input:     Raw text from the user
+            session_id:     Optional session identifier for audit trail
+            system_prompt:  Optional system prompt for Output Guard leakage detection
 
         Returns:
             Final state dict with response_to_user, threat info, audit_log
         """
         initial_state: GuardianState = {
-            "user_input": user_input,
-            "sanitized_input": None,
-            "input_guard_result": None,
-            "memory_guard_result": None,
-            "tool_guard_result": None,
-            "output_guard_result": None,
-            "trust_agent_result": None,
-            "pending_tool_call": None,
-            "threat_severity": "NONE",
-            "action_taken": "",
-            "response_to_user": "",
-            "session_id": session_id or str(uuid.uuid4()),
-            "request_id": str(uuid.uuid4()),
-            "is_blocked": False,
-            "audit_log": [],
+            "user_input":           user_input,
+            "sanitized_input":      None,
+            "input_guard_result":   None,
+            "memory_guard_result":  None,
+            "tool_guard_result":    None,
+            "output_guard_result":  None,
+            "trust_agent_result":   None,
+            "pending_tool_call":    None,
+            "system_prompt":        system_prompt,   # Day 5
+            "agent_response":       None,            # Day 5
+            "threat_severity":      "NONE",
+            "action_taken":         "",
+            "response_to_user":     "",
+            "session_id":           session_id or str(uuid.uuid4()),
+            "request_id":           str(uuid.uuid4()),
+            "is_blocked":           False,
+            "audit_log":            [],
         }
 
         final_state = self.graph.invoke(initial_state)
