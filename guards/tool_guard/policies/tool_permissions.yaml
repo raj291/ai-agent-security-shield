@@ -1,0 +1,57 @@
+# Tool Permission Matrix — AI Agent Security Shield
+#
+# Edit this file to change which agent roles can use which tools.
+# No code changes needed — the PermissionMatrix reads this at startup.
+#
+# allowed_roles: list of agent role strings, OR [any] to allow all roles
+# forbidden_keywords: blocked strings in any parameter value (case-insensitive)
+# forbidden_tables: blocked table names in any parameter value
+# allowed_paths: file_read path must start with one of these
+# allowed_domains: http_request URL must contain one of these
+
+tools:
+
+  database_query:
+    description: "Read-only database queries against business data"
+    allowed_roles: [customer_support, analyst]
+    # Destructive SQL keywords are always blocked regardless of role
+    forbidden_keywords: [DROP, TRUNCATE, DELETE, INSERT, UPDATE, ALTER, EXEC, EXECUTE]
+    # Sensitive tables are never accessible through the agent
+    forbidden_tables: [users_credentials, audit_logs, api_keys, sessions, password_resets]
+    max_query_length: 2000
+
+  send_email:
+    description: "Send outbound emails to customers"
+    allowed_roles: [customer_support]
+    max_recipients: 5
+
+  file_read:
+    description: "Read files from approved directories only"
+    allowed_roles: [analyst, customer_support]
+    # Requests for paths outside these prefixes are denied
+    allowed_paths:
+      - "/data/reports/"
+      - "/data/exports/"
+      - "/data/public/"
+
+  http_request:
+    description: "HTTP calls to approved external APIs only"
+    allowed_roles: [analyst]
+    # Requests to domains not in this list are denied
+    allowed_domains:
+      - "api.company.com"
+      - "data.company.com"
+      - "public-api.company.com"
+
+  agent_message:
+    description: "Send a message to another agent in the system"
+    # All roles can message other agents
+    allowed_roles: [any]
+
+# Per-tool rate limits (calls per 60-second sliding window, per session_id)
+# "default" applies to any tool not listed here
+rate_limits:
+  default: 50
+  send_email: 10
+  http_request: 20
+  database_query: 30

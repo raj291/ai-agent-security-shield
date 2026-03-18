@@ -46,6 +46,12 @@ class GuardianState(TypedDict):
     output_guard_result: Optional[dict]     # Day 5
     trust_agent_result: Optional[dict]      # Day 7
 
+    # --- Tool Call (Day 4) ---
+    # Populated when a protected agent wants to call an external tool.
+    # tool_guard_node reads this, validates it, and writes result to tool_guard_result.
+    # Format: {tool_name, agent_role, session_id, parameters}
+    pending_tool_call: Optional[dict]       # Tool call awaiting validation
+
     # --- Commander Decision ---
     threat_severity: ThreatSeverity         # Commander's severity assessment
     action_taken: str                       # What action was executed

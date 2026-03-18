@@ -25,8 +25,16 @@
    - The Four Guard Components (AttackStore, PdfScanner, ContextWindowMonitor, MemoryScanner)
    - ChromaDB: Two Collections, Two Purposes
    - Test Results Day 3
-5. [Interview Q&A Bank](#5-interview-qa-bank)
-6. [Key Concepts Glossary](#6-key-concepts-glossary)
+5. [Day 4 — Tool Guard (Least-Privilege Tool Proxy)](#5-day-4-tool-guard-least-privilege-tool-proxy)
+   - Why Tool Calls Are the Most Dangerous Attack Surface
+   - Tool Guard Architecture: Four Enforcement Layers
+   - Permission Matrix — YAML-Driven Fail-Closed Policy
+   - Sliding-Window Rate Limiter — No Redis Required
+   - Parameter Sanitizer — Injection Attacks in Tool Parameters
+   - Response Validator — Stopping Data Exfiltration at the Output
+   - Test Results Day 4
+6. [Interview Q&A Bank](#6-interview-qa-bank)
+7. [Key Concepts Glossary](#7-key-concepts-glossary)
 
 ---
 
@@ -791,7 +799,191 @@ The fail-safe wrapper is critical: if ChromaDB is down for maintenance, scanning
 
 ---
 
-## 5. Interview Q&A Bank
+## 5. Day 4 — Tool Guard (Least-Privilege Tool Proxy)
+
+### 5.1 Why Tool Calls Are the Most Dangerous Attack Surface
+
+When an AI agent has tools, the attack surface explodes. Without a guard, a single prompt injection can:
+- Execute arbitrary SQL: `SELECT * FROM users_credentials` or `DROP TABLE orders`
+- Read sensitive files: `../../etc/passwd`, `/root/.ssh/id_rsa`
+- Exfiltrate data via HTTP: POST to an attacker-controlled server
+- Spam emails: send 10,000 emails using the `send_email` tool
+- Move laterally: call `agent_message` to compromise another agent
+
+The Tool Guard intercepts every tool call **before** execution, enforcing least-privilege exactly like `sudo` does for Unix processes — but at the AI agent layer.
+
+**The core principle:** Agents should only access tools they need for their designated role. A customer support agent has no business calling `http_request` or reading arbitrary files.
+
+---
+
+### 5.2 Tool Guard Architecture: Four Enforcement Layers
+
+```
+Tool Call Request
+       │
+       ▼
+┌──────────────────────┐
+│  1. PermissionMatrix │  Is this role allowed to use this tool?
+│     (YAML-driven)    │  Fail-closed: unknown tool → DENIED
+└──────────┬───────────┘
+           │ ALLOWED
+           ▼
+┌──────────────────────┐
+│  2. RateLimiter      │  Has this session hit the call limit?
+│  (sliding window)    │  Per-tool limits: email=10, http=20, db=30
+└──────────┬───────────┘
+           │ WITHIN LIMIT
+           ▼
+┌──────────────────────┐
+│  3. ParameterSanit.  │  Do parameters contain injection attacks?
+│  (21 regex patterns) │  SQL injection, path traversal, cmd inj., SSRF
+└──────────┬───────────┘
+           │ CLEAN
+           ▼
+       ALLOWED — execute tool
+           │
+           ▼
+┌──────────────────────┐
+│  4. ResponseValidator│  Is the response safe to inject into LLM context?
+│  (post-execution)    │  Size ≤ 1MB, no credentials in response body
+└──────────────────────┘
+```
+
+**Short-circuit design:** Each layer only runs if previous layers pass. Permission denied → skip rate limit + sanitizer. This keeps latency low (~0.5ms for DENIED paths).
+
+---
+
+### 5.3 Permission Matrix — YAML-Driven Fail-Closed Policy
+
+`guards/tool_guard/policies/tool_permissions.yaml` maps roles to tools with no code changes required:
+
+```yaml
+tools:
+  database_query:
+    allowed_roles: [customer_support, analyst]
+    forbidden_keywords: [DROP, TRUNCATE, DELETE, INSERT, UPDATE, ALTER]
+    forbidden_tables: [users_credentials, audit_logs, api_keys, sessions]
+  send_email:
+    allowed_roles: [customer_support]
+    max_recipients: 5
+  http_request:
+    allowed_roles: [analyst]
+    allowed_domains: ["api.company.com", "data.company.com"]
+  agent_message:
+    allowed_roles: [any]   # Any role can message other agents
+
+rate_limits:
+  default: 50        # calls per 60s per session
+  send_email: 10
+  http_request: 20
+  database_query: 30
+```
+
+**Six layered permission checks (in order):**
+1. Tool exists in matrix → DENIED if not (fail-closed)
+2. Role in `allowed_roles` (or `any`) → DENIED if not
+3. No forbidden keywords in parameters (SQL DDL keywords)
+4. No forbidden tables referenced in query
+5. File path starts with `allowed_paths` (file_read tool)
+6. URL domain in `allowed_domains` (http_request tool)
+
+**Why YAML over hardcoded policy?** Same principle as `attack_patterns.yaml` and `scope_policy.yaml` — security teams can update policies without engineering involvement. Adding a new role or restricting a tool takes 30 seconds.
+
+**Why fail-closed?** Opposite of the scope validator (which fails open). For tool execution, the blast radius of a wrong "allow" (data exfiltration, email spam) vastly outweighs the cost of a wrong "deny" (a tool call fails with a clear error).
+
+---
+
+### 5.4 Sliding-Window Rate Limiter — No Redis Required
+
+**Implementation:** `collections.deque` with Unix timestamps. Each entry in the deque is the timestamp of a past call. On each check, entries older than 60 seconds are pruned.
+
+```python
+class RateLimiter:
+    _store: dict = {}   # class-level — persists across instances within one process
+
+    def check(self, session_id, tool_name, limit) -> RateLimitResult:
+        timestamps = self._get_timestamps(session_id, tool_name)
+        self._clean_old(timestamps)          # prune calls > 60s ago
+        count = len(timestamps)
+        return RateLimitResult(allowed=count < limit, calls_in_window=count, ...)
+
+    def record(self, session_id, tool_name):
+        timestamps = self._get_timestamps(session_id, tool_name)
+        timestamps.append(time.time())       # only called after ALLOWED
+```
+
+**Why two-step (check then record)?** On denial paths (permission/injection), we don't call `record()`. This prevents a malicious agent from exhausting rate limits by sending invalid calls that get denied.
+
+**Why class-level `_store` vs instance-level?** If the store were instance-level, creating a new `ToolGuard()` per request would reset the window — trivially bypassed. Module-level `_rate_limiter = RateLimiter()` in `tool_guard.py` ensures the deque persists for the process lifetime.
+
+**Sliding window vs fixed bucket:** Fixed bucket resets at clock boundaries (e.g., 12:00:00). An attacker can send 50 calls at 11:59:59 and 50 more at 12:00:01. Sliding window counts any 60-second interval — no boundary reset to exploit.
+
+**Production upgrade path:** Replace `_store` dict with Redis `ZADD`/`ZRANGEBYSCORE` calls. The interface stays identical. This is Day 4's deliberate simplification — the right abstraction is in place.
+
+---
+
+### 5.5 Parameter Sanitizer — Injection Attacks in Tool Parameters
+
+Input Guard scans user-facing prompts. Parameter Sanitizer scans the structured `parameters` dict of tool calls — a different attack surface where injections arrive as key-value pairs.
+
+**21 patterns across 4 threat categories:**
+
+| Category | Examples | Why Dangerous |
+|----------|----------|---------------|
+| SQL Injection | `UNION SELECT`, `DROP TABLE`, `'; DELETE`, `SLEEP(5)`, `--` comment | Data exfiltration, schema destruction, blind injection to extract data |
+| Path Traversal | `../../etc/passwd`, `%2e%2e/`, `..\windows\system32`, null bytes | Read any file on the system including credentials, SSH keys |
+| Command Injection | `; rm -rf`, backtick exec, `$(id)`, `\|\| bash` | Execute arbitrary shell commands via vulnerable tool implementations |
+| SSRF | `169.254.169.254` (AWS metadata), `localhost`, `10.x.x.x`, `192.168.x.x` | Reach internal services, steal cloud credentials via metadata endpoint |
+
+**Obfuscation awareness:** Reuses `TextPreprocessor` from Input Guard — hex decoding, URL decoding, leet-speak normalization applied before scanning. An attacker can't bypass detection with `%2e%2e/../etc/passwd`.
+
+**Scanning all string values:** The sanitizer iterates over every string value in the parameters dict, not just known "dangerous" keys. An attacker can't hide an injection in a parameter named `user_comment` that gets concatenated into a SQL query.
+
+---
+
+### 5.6 Response Validator — Stopping Data Exfiltration at the Output
+
+Even if a tool call is legitimate, the response can be dangerous if injected into the LLM context:
+
+1. **Oversized responses (context stuffing):** A database query returns 10MB of data. The LLM context gets flooded, potentially displacing system prompt instructions. Limit: 1MB.
+
+2. **Credential leakage:** A compromised tool returns its own API key or a user's password. These strings should never enter the LLM context. Patterns checked:
+   - `api_key = sk-...` (OpenAI-style)
+   - `password = hunter2` (any key=value credential pair)
+   - `-----BEGIN RSA PRIVATE KEY-----`
+   - `AKIA...` (AWS access key IDs)
+   - `xoxb-...` (Slack bot tokens)
+
+**Why validate responses at all?** Defense in depth. The tool itself may be compromised or misconfigured — validation adds a post-execution checkpoint before the LLM ever sees the data.
+
+---
+
+### 5.7 Test Results — Day 4
+
+| Metric | Result |
+|--------|--------|
+| Total tests | 183 |
+| All tests passing | ✅ 183/183 |
+| Days 1–3 regressions | 0 |
+| New tests (Day 4) | 54 |
+
+**New test classes:**
+- `TestPermissionMatrix` (11 tests) — authorized roles, unauthorized roles, unknown tools, forbidden keywords/tables, `any`-role tools, path restrictions, domain restrictions
+- `TestRateLimiter` (6 tests) — within limit, exceeds limit, per-tool email limit (10), session isolation, field accuracy
+- `TestParameterSanitizer` (18 tests) — SQL (union, drop, comment, blind sleep), path traversal (unix, etc/passwd, url-encoded), command injection (semicolon, backtick, subshell), SSRF (localhost, AWS metadata, internal IP), clean params (0% false positives)
+- `TestResponseValidator` (7 tests) — valid, empty, oversized, custom size, credential leak, private key, size accuracy
+- `TestToolGuard` (12 tests) — end-to-end for all attack types + rate limiting + `check_for_graph` dict interface
+
+**Graph topology after Day 4:**
+```
+START → input_guard → memory_guard → tool_guard → guardian_commander → [protected_agent | END]
+```
+
+`tool_guard_node` returns `{}` when no `pending_tool_call` in state — backwards-compatible with all existing text-only tests.
+
+---
+
+## 6. Interview Q&A Bank
 
 ### Architecture Questions
 
@@ -905,7 +1097,7 @@ A: "Attackers embed zero-width spaces, zero-width joiners, and other invisible U
 
 ---
 
-## 6. Key Concepts Glossary
+## 7. Key Concepts Glossary
 
 | Term | Definition |
 |------|-----------|
@@ -956,4 +1148,4 @@ A: "Attackers embed zero-width spaces, zero-width joiners, and other invisible U
 
 ---
 
-*Last updated: Day 3 complete — Memory Guard (RAG poisoning prevention), MemoryScanner (26 document-specific patterns + reuse of 65+ Input Guard patterns), RagStore (safe ChromaDB wrapper, two-phase validation), ChromaDB two-collection architecture. 88/88 tests passing.*
+*Last updated: Day 4 complete — Tool Guard (least-privilege tool proxy), PermissionMatrix (YAML-driven, fail-closed), RateLimiter (sliding-window in-memory, no Redis), ParameterSanitizer (21 patterns: SQL injection, path traversal, command injection, SSRF), ResponseValidator (1MB size cap, credential leakage detection). Graph topology: START → input_guard → memory_guard → tool_guard → guardian_commander → END. 183/183 tests passing.*

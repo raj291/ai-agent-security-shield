@@ -14,13 +14,13 @@ Architecture: LangGraph StateGraph
   - Edges define the routing logic
   - Conditional edges allow dynamic routing based on state
 
-Graph topology (Day 3):
-  START → input_guard → guardian_commander → [END | protected_agent] → END
-  Documents also routed through → memory_guard_node (RAG ingestion path)
+Graph topology (Day 4):
+  START → input_guard → memory_guard → tool_guard → guardian_commander → [END | protected_agent] → END
 
 Day 1: Input Guard Layer 1 (pattern matching)
 Day 2: Input Guard Layer 2 (LLM classifier) + Layer 3 (scope validator)
 Day 3: Memory Guard (RAG poisoning prevention)
+Day 4: Tool Guard (least-privilege tool proxy)
 """
 import uuid
 import logging
@@ -277,6 +277,67 @@ def memory_guard_node(state: GuardianState) -> dict:
     }
 
 
+def tool_guard_node(state: GuardianState) -> dict:
+    """
+    LangGraph node that validates pending tool calls (Day 4+).
+
+    Called when state contains a 'pending_tool_call' key.
+    Silently skips (returns {}) for regular text requests with no tool call.
+
+    Flow:
+      1. PermissionMatrix: is this role allowed to use this tool?
+      2. RateLimiter: has this session exceeded the per-tool limit?
+      3. ParameterSanitizer: do params contain SQL injection / path traversal / SSRF?
+      4. If DENIED or RATE_LIMITED → set is_blocked=True
+
+    State keys read:
+      pending_tool_call : dict — {tool_name, agent_role, session_id, parameters}
+
+    State keys written:
+      tool_guard_result : dict — Full validation result
+      is_blocked        : bool — True if tool call was denied
+      audit_log         : list — Updated audit trail
+    """
+    from guards.tool_guard import ToolGuard
+
+    tool_call = state.get("pending_tool_call")
+    if not tool_call:
+        logger.debug("[ToolGuardNode] No pending tool call — skipping")
+        return {}
+
+    guard  = ToolGuard()
+    result = guard.check_for_graph(tool_call)
+
+    audit_entry = {
+        "event":         "TOOL_GUARD_CHECK",
+        "verdict":       result["verdict"],
+        "tool_name":     result["tool_name"],
+        "agent_role":    result["agent_role"],
+        "denial_reason": result["denial_reason"],
+        "threat_type":   result["threat_type"],
+        "confidence":    result["confidence"],
+    }
+    current_log = state.get("audit_log", [])
+    updates: dict = {
+        "tool_guard_result": result,
+        "audit_log": current_log + [audit_entry],
+    }
+
+    if result["verdict"] != "ALLOWED":
+        updates["is_blocked"] = True
+        logger.warning(
+            f"[ToolGuardNode] BLOCKED | tool={result['tool_name']} | "
+            f"verdict={result['verdict']} | reason={result['denial_reason']}"
+        )
+    else:
+        logger.info(
+            f"[ToolGuardNode] ALLOWED | tool={result['tool_name']} | "
+            f"role={result['agent_role']}"
+        )
+
+    return updates
+
+
 def protected_agent_node(state: GuardianState) -> dict:
     """
     Represents the AI agent being protected.
@@ -342,15 +403,18 @@ def build_guardian_graph() -> CompiledStateGraph:
     # Register nodes
     graph.add_node("input_guard", input_guard_node)
     graph.add_node("memory_guard", memory_guard_node)   # Day 3
+    graph.add_node("tool_guard", tool_guard_node)       # Day 4
     graph.add_node("guardian_commander", guardian_commander_node)
     graph.add_node("protected_agent", protected_agent_node)
 
     # Entry point: all requests start at input_guard
     graph.set_entry_point("input_guard")
 
-    # input_guard → memory_guard (document scans run in sequence) → guardian_commander
+    # Day 4 graph: input_guard → memory_guard → tool_guard → guardian_commander
+    # tool_guard returns {} when no pending_tool_call (silently passes through)
     graph.add_edge("input_guard", "memory_guard")
-    graph.add_edge("memory_guard", "guardian_commander")
+    graph.add_edge("memory_guard", "tool_guard")
+    graph.add_edge("tool_guard", "guardian_commander")
 
     # guardian_commander → conditional routing
     graph.add_conditional_edges(
@@ -401,6 +465,7 @@ class GuardianCommander:
             "tool_guard_result": None,
             "output_guard_result": None,
             "trust_agent_result": None,
+            "pending_tool_call": None,
             "threat_severity": "NONE",
             "action_taken": "",
             "response_to_user": "",
